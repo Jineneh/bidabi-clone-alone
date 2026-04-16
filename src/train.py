@@ -1,155 +1,210 @@
 import os
-os.environ["MPLBACKEND"] = "Agg"
-import matplotlib
-matplotlib.use("Agg")
-import matplotlib.pyplot as plt
+import copy
+import json
 import torch
 import torch.nn as nn
 import torch.optim as optim
-from torch.utils.data import Dataset, DataLoader, random_split
-from torchvision import models, transforms
-from PIL import Image
+from torch.utils.data import DataLoader, random_split
+from torchvision import datasets, models, transforms
 
-DATA_DIR = "data/raw"
-IMAGES_DIR = os.path.join(DATA_DIR, "images")
-MODEL_DIR = "data/models"
+# -------------------------
+# Configuration
+# -------------------------
+DATA_DIR    = "data/raw/images"
+MODEL_DIR   = "models"
+METRICS_FILE = os.path.join(MODEL_DIR, "metrics.json")
+BEST_MODEL   = os.path.join(MODEL_DIR, "best_model.pth")
+
+NUM_EPOCHS  = 15
+BATCH_SIZE  = 16
+LR          = 1e-4
+NUM_WORKERS = 0          # 0 = safe on Windows
+SEED        = 42
+
+TRAIN_RATIO = 0.70
+VAL_RATIO   = 0.15
+# TEST_RATIO  = 0.15  (le reste)
+
 os.makedirs(MODEL_DIR, exist_ok=True)
-BATCH_SIZE = 32
-EPOCHS = 10
-LR = 0.001
-IMG_SIZE = 224
-TRAIN_RATIO = 0.7
-VAL_RATIO = 0.15
-DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-print(f"Device : {DEVICE}")
+torch.manual_seed(SEED)
 
-class FoodDataset(Dataset):
-    def __init__(self, samples, transform=None):
-        self.samples = samples
-        self.transform = transform
-    def __len__(self):
-        return len(self.samples)
-    def __getitem__(self, idx):
-        path, label = self.samples[idx]
-        try:
-            img = Image.open(path).convert("RGB")
-        except Exception:
-            img = Image.new("RGB", (IMG_SIZE, IMG_SIZE))
-        if self.transform:
-            img = self.transform(img)
-        return img, label
+# -------------------------
+# Device
+# -------------------------
+device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+print(f"Device : {device}")
 
-def load_samples():
-    categories = sorted(os.listdir(IMAGES_DIR))
-    label_map = {cat: i for i, cat in enumerate(categories)}
-    print(f"Categories : {label_map}")
-    samples = []
-    for cat in categories:
-        folder = os.path.join(IMAGES_DIR, cat)
-        for fname in os.listdir(folder):
-            if fname.lower().endswith((".jpg", ".jpeg", ".png")):
-                samples.append((os.path.join(folder, fname), label_map[cat]))
-    print(f"Total images : {len(samples)}")
-    return samples, label_map
-
+# -------------------------
+# Transforms
+# -------------------------
 train_transform = transforms.Compose([
-    transforms.Resize((IMG_SIZE, IMG_SIZE)),
+    transforms.Resize((128, 128)),
     transforms.RandomHorizontalFlip(),
     transforms.RandomRotation(15),
-    transforms.ColorJitter(brightness=0.3, contrast=0.3),
+    transforms.ColorJitter(brightness=0.3, contrast=0.3, saturation=0.2),
     transforms.ToTensor(),
-    transforms.Normalize([0.485,0.456,0.406],[0.229,0.224,0.225])
-])
-val_transform = transforms.Compose([
-    transforms.Resize((IMG_SIZE, IMG_SIZE)),
-    transforms.ToTensor(),
-    transforms.Normalize([0.485,0.456,0.406],[0.229,0.224,0.225])
+    transforms.Normalize([0.485, 0.456, 0.406],
+                         [0.229, 0.224, 0.225]),
 ])
 
-def train():
-    samples, label_map = load_samples()
-    num_classes = len(label_map)
-    total = len(samples)
-    n_train = int(total * TRAIN_RATIO)
-    n_val = int(total * VAL_RATIO)
-    n_test = total - n_train - n_val
-    full_dataset = FoodDataset(samples, transform=train_transform)
-    train_set, val_set, test_set = random_split(
-        full_dataset, [n_train, n_val, n_test],
-        generator=torch.Generator().manual_seed(42)
-    )
-    val_set.dataset = FoodDataset(samples, transform=val_transform)
-    test_set.dataset = FoodDataset(samples, transform=val_transform)
-    train_loader = DataLoader(train_set, batch_size=BATCH_SIZE, shuffle=True)
-    val_loader = DataLoader(val_set, batch_size=BATCH_SIZE)
-    test_loader = DataLoader(test_set, batch_size=BATCH_SIZE)
-    print(f"Train: {len(train_set)} | Val: {len(val_set)} | Test: {len(test_set)}")
+val_test_transform = transforms.Compose([
+    transforms.Resize((128, 128)),
+    transforms.ToTensor(),
+    transforms.Normalize([0.485, 0.456, 0.406],
+                         [0.229, 0.224, 0.225]),
+])
 
-    model = models.resnet18(weights=models.ResNet18_Weights.DEFAULT)
-    model.fc = nn.Linear(model.fc.in_features, num_classes)
-    model = model.to(DEVICE)
-    criterion = nn.CrossEntropyLoss()
-    optimizer = optim.Adam(model.parameters(), lr=LR)
-    best_val_acc = 0.0
-    history = {"train_loss": [], "val_acc": []}
+# -------------------------
+# Dataset & splits
+# -------------------------
+full_dataset = datasets.ImageFolder(
+    root=DATA_DIR,
+    transform=train_transform,
+    is_valid_file=lambda p: p.lower().endswith((".jpg", ".jpeg", ".png"))
+)
 
-    for epoch in range(EPOCHS):
-        model.train()
-        running_loss = 0.0
-        for images, labels in train_loader:
-            images, labels = images.to(DEVICE), labels.to(DEVICE)
-            optimizer.zero_grad()
+classes = full_dataset.classes
+num_classes = len(classes)
+print(f"Classes ({num_classes}) : {classes}")
+print(f"Total images : {len(full_dataset)}")
+
+n_total = len(full_dataset)
+n_train = int(n_total * TRAIN_RATIO)
+n_val   = int(n_total * VAL_RATIO)
+n_test  = n_total - n_train - n_val
+
+train_set, val_set, test_set = random_split(
+    full_dataset, [n_train, n_val, n_test],
+    generator=torch.Generator().manual_seed(SEED)
+)
+
+# Appliquer le bon transform sur val et test
+val_set.dataset  = copy.deepcopy(full_dataset)
+test_set.dataset = copy.deepcopy(full_dataset)
+val_set.dataset.transform  = val_test_transform
+test_set.dataset.transform = val_test_transform
+
+print(f"Split → train: {n_train} | val: {n_val} | test: {n_test}")
+
+train_loader = DataLoader(train_set, batch_size=BATCH_SIZE, shuffle=True,  num_workers=NUM_WORKERS)
+val_loader   = DataLoader(val_set,   batch_size=BATCH_SIZE, shuffle=False, num_workers=NUM_WORKERS)
+test_loader  = DataLoader(test_set,  batch_size=BATCH_SIZE, shuffle=False, num_workers=NUM_WORKERS)
+
+# -------------------------
+# Modèle ResNet-18
+# -------------------------
+model = models.resnet18(weights=models.ResNet18_Weights.DEFAULT)
+
+# Geler toutes les couches sauf la dernière
+for param in model.parameters():
+    param.requires_grad = False
+
+# Remplacer la tête de classification
+model.fc = nn.Linear(model.fc.in_features, num_classes)
+model = model.to(device)
+
+criterion = nn.CrossEntropyLoss()
+optimizer = optim.Adam(model.fc.parameters(), lr=LR)
+scheduler = optim.lr_scheduler.StepLR(optimizer, step_size=5, gamma=0.5)
+
+# -------------------------
+# Boucle d'entraînement
+# -------------------------
+history = {"train_loss": [], "train_acc": [], "val_loss": [], "val_acc": []}
+best_val_acc = 0.0
+best_weights = None
+
+print("\n=== Début de l'entraînement ===")
+
+for epoch in range(NUM_EPOCHS):
+
+    # --- TRAIN ---
+    model.train()
+    running_loss, correct, total = 0.0, 0, 0
+
+    for images, labels in train_loader:
+        images, labels = images.to(device), labels.to(device)
+        optimizer.zero_grad()
+        outputs = model(images)
+        loss = criterion(outputs, labels)
+        loss.backward()
+        optimizer.step()
+
+        running_loss += loss.item() * images.size(0)
+        _, preds = torch.max(outputs, 1)
+        correct  += (preds == labels).sum().item()
+        total    += labels.size(0)
+
+    train_loss = running_loss / total
+    train_acc  = correct / total
+
+    # --- VAL ---
+    model.eval()
+    val_loss, val_correct, val_total = 0.0, 0, 0
+
+    with torch.no_grad():
+        for images, labels in val_loader:
+            images, labels = images.to(device), labels.to(device)
             outputs = model(images)
             loss = criterion(outputs, labels)
-            loss.backward()
-            optimizer.step()
-            running_loss += loss.item()
-        avg_loss = running_loss / len(train_loader)
+            val_loss    += loss.item() * images.size(0)
+            _, preds     = torch.max(outputs, 1)
+            val_correct += (preds == labels).sum().item()
+            val_total   += labels.size(0)
 
-        model.eval()
-        correct, total_val = 0, 0
-        with torch.no_grad():
-            for images, labels in val_loader:
-                images, labels = images.to(DEVICE), labels.to(DEVICE)
-                outputs = model(images)
-                _, predicted = torch.max(outputs, 1)
-                correct += (predicted == labels).sum().item()
-                total_val += labels.size(0)
-        val_acc = correct / total_val
-        history["train_loss"].append(avg_loss)
-        history["val_acc"].append(val_acc)
-        print(f"Epoch {epoch+1}/{EPOCHS} | Loss: {avg_loss:.4f} | Val Acc: {val_acc:.4f}")
+    val_loss = val_loss / val_total
+    val_acc  = val_correct / val_total
 
-        if val_acc > best_val_acc:
-            best_val_acc = val_acc
-            torch.save(model.state_dict(), f"{MODEL_DIR}/best_model.pth")
-            print(f"  Meilleur modele sauvegarde (val_acc={val_acc:.4f})")
+    scheduler.step()
 
-    model.load_state_dict(torch.load(f"{MODEL_DIR}/best_model.pth"))
-    model.eval()
-    correct, total_test = 0, 0
-    with torch.no_grad():
-        for images, labels in test_loader:
-            images, labels = images.to(DEVICE), labels.to(DEVICE)
-            outputs = model(images)
-            _, predicted = torch.max(outputs, 1)
-            correct += (predicted == labels).sum().item()
-            total_test += labels.size(0)
-    test_acc = correct / total_test
-    print(f"\nTest Accuracy : {test_acc:.4f}")
+    history["train_loss"].append(round(train_loss, 4))
+    history["train_acc"].append(round(train_acc, 4))
+    history["val_loss"].append(round(val_loss, 4))
+    history["val_acc"].append(round(val_acc, 4))
 
-    plt.figure(figsize=(10, 4))
-    plt.subplot(1, 2, 1)
-    plt.plot(history["train_loss"], label="Train Loss")
-    plt.title("Loss")
-    plt.legend()
-    plt.subplot(1, 2, 2)
-    plt.plot(history["val_acc"], label="Val Accuracy")
-    plt.title("Validation Accuracy")
-    plt.legend()
-    plt.tight_layout()
-    plt.savefig(f"{MODEL_DIR}/training_curves.png")
-    print(f"Courbes sauvegardees dans {MODEL_DIR}/training_curves.png")
+    print(f"Epoch [{epoch+1:02d}/{NUM_EPOCHS}] "
+          f"Train loss: {train_loss:.4f} acc: {train_acc:.4f} | "
+          f"Val loss: {val_loss:.4f} acc: {val_acc:.4f}")
 
-if __name__ == "__main__":
-    train()
+    # Sauvegarder le meilleur modèle
+    if val_acc > best_val_acc:
+        best_val_acc = val_acc
+        best_weights = copy.deepcopy(model.state_dict())
+        torch.save(best_weights, BEST_MODEL)
+        print(f"  ✔ Meilleur modèle sauvegardé (val_acc={val_acc:.4f})")
+
+# -------------------------
+# Évaluation sur le test set
+# -------------------------
+model.load_state_dict(best_weights)
+model.eval()
+
+test_correct, test_total = 0, 0
+with torch.no_grad():
+    for images, labels in test_loader:
+        images, labels = images.to(device), labels.to(device)
+        outputs = model(images)
+        _, preds = torch.max(outputs, 1)
+        test_correct += (preds == labels).sum().item()
+        test_total   += labels.size(0)
+
+test_acc = test_correct / test_total
+print(f"\n=== Test accuracy : {test_acc:.4f} ===")
+
+# -------------------------
+# Sauvegarde des métriques
+# -------------------------
+metrics = {
+    "classes": classes,
+    "num_classes": num_classes,
+    "epochs": NUM_EPOCHS,
+    "best_val_acc": round(best_val_acc, 4),
+    "test_acc": round(test_acc, 4),
+    "history": history
+}
+
+with open(METRICS_FILE, "w") as f:
+    json.dump(metrics, f, indent=2)
+
+print(f"Métriques sauvegardées dans {METRICS_FILE}")
+print(f"Modèle sauvegardé dans {BEST_MODEL}")
